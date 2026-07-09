@@ -127,9 +127,14 @@ class EclipseClient:
         self.mod_query = ""
         self._photo_refs = []  # keep PhotoImage alive
         self._placeholder_icon = None
+        self._mod_map = {}  # project_id -> filename
+        self._installing_mod_ids = set()  # project_ids currently being installed
+        self._mod_card_frames = {}  # project_id -> {"frame": Frame, "btn": Button}
+        self._mod_map_path = self.minecraft_dir / "eclipse_cache" / "mod_map.json"
 
         self._setup_styles()
         self._load_config()
+        self._load_mod_map()
         self._make_placeholder_icon()
         self.create_ui()
         self.root.after(50, self._animate_particles)
@@ -380,6 +385,29 @@ class EclipseClient:
         d = self.minecraft_dir / "mods"
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def _load_mod_map(self):
+        try:
+            if self._mod_map_path.exists():
+                self._mod_map = json.loads(self._mod_map_path.read_text(encoding="utf-8"))
+        except Exception:
+            self._mod_map = {}
+
+    def _save_mod_map(self):
+        try:
+            self._mod_map_path.parent.mkdir(parents=True, exist_ok=True)
+            self._mod_map_path.write_text(json.dumps(self._mod_map), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _clean_mod_map(self):
+        """Remove stale entries whose files no longer exist."""
+        mods_dir = self.mods_target_dir()
+        stale = [pid for pid, fname in self._mod_map.items() if not (mods_dir / fname).exists()]
+        for pid in stale:
+            del self._mod_map[pid]
+        if stale:
+            self._save_mod_map()
 
     def _try_restore_session(self):
         sess = self.config.get("session")
@@ -1473,18 +1501,39 @@ class EclipseClient:
         dl_s = f"{dl/1_000_000:.1f}M" if dl >= 1_000_000 else (f"{dl/1000:.0f}k" if dl >= 1000 else str(dl))
         tk.Label(card, text=f"{dl_s} downloads", bg=C["card"], fg=C["moon_dim"], font=("Segoe UI", 8)).pack()
 
-        self._btn(
-            card,
-            "Install",
-            lambda h=hit: self.install_mod_hit(h),
-            kind="primary",
-            padx=16,
-            pady=4,
-        ).pack(pady=(8, 12))
+        # Determine button state: Uninstall (installed), Installing, or Install
+        is_installing = project_id in self._installing_mod_ids
+        is_installed = project_id in self._mod_map
+
+        if is_installing:
+            btn_text = "Installing…"
+            btn_kind = "mod"
+            btn_cmd = None
+        elif is_installed:
+            btn_text = "Uninstall"
+            btn_kind = "play"  # green
+            btn_cmd = lambda h=hit: self._uninstall_mod_hit(h)
+        else:
+            btn_text = "Install"
+            btn_kind = "primary"
+            btn_cmd = lambda h=hit: self.install_mod_hit(h)
+
+        btn = self._btn(card, btn_text, btn_cmd if btn_cmd else lambda: None, kind=btn_kind, padx=16, pady=4)
+        if is_installing:
+            btn.config(state="disabled")
+        btn.pack(pady=(8, 12))
+
+        self._mod_card_frames[project_id] = {"frame": card, "btn": btn}
 
         return card
 
     def install_mod_hit(self, hit):
+        project_id = hit.get("project_id") or hit.get("slug")
+        if not project_id:
+            return
+        self._installing_mod_ids.add(project_id)
+        self._refresh_mod_cards_state()
+
         pack = self.get_active_modpack()
         if pack:
             game_version = pack.get("mc_version")
@@ -1506,6 +1555,8 @@ class EclipseClient:
                     initialvalue="1.20.1",
                 )
                 if not game_version:
+                    self._installing_mod_ids.discard(project_id)
+                    self._refresh_mod_cards_state()
                     return
 
         self.set_status(f"Installing {hit.get('title')}…")
@@ -1515,13 +1566,36 @@ class EclipseClient:
             daemon=True,
         ).start()
 
+    def _uninstall_mod_hit(self, hit):
+        project_id = hit.get("project_id") or hit.get("slug")
+        fname = self._mod_map.pop(project_id, None)
+        if fname:
+            jar = self.mods_target_dir() / fname
+            if jar.exists():
+                jar.unlink()
+            pack = self.get_active_modpack()
+            if pack and fname in pack.get("mods", []):
+                pack["mods"] = [m for m in pack["mods"] if m != fname]
+                self._save_config()
+            self._save_mod_map()
+            self.refresh_installed_mods()
+            self._refresh_mod_cards_state()
+            self.set_status(f"Uninstalled {hit.get('title')}")
+
+    def _refresh_mod_cards_state(self):
+        """Re-render mod cards to reflect current install/uninstall/installing state."""
+        if self.mod_results:
+            self._mod_card_frames.clear()
+            self._render_mod_cards(self.mod_results, {})
+
     def _install_mod_with_deps(self, hit, game_version, loader):
+        project_id = hit.get("project_id") or hit.get("slug")
         with self._mod_install_lock:
             try:
                 installed = []
                 seen = set()
                 self._install_project_recursive(
-                    hit.get("project_id") or hit.get("slug"),
+                    project_id,
                     game_version,
                     loader,
                     installed,
@@ -1539,16 +1613,22 @@ class EclipseClient:
                 names = ", ".join(installed[:8]) + ("…" if len(installed) > 8 else "")
                 self.set_status(f"Installed {len(installed)} file(s)")
                 self.refresh_installed_mods()
-                self.ui(
-                    lambda: messagebox.showinfo(
+                self._installing_mod_ids.discard(project_id)
+                self.ui(lambda: (
+                    self._refresh_mod_cards_state(),
+                    messagebox.showinfo(
                         "Mods installed",
                         f"Installed {len(installed)} file(s) including dependencies:\n\n{names}\n\n"
                         f"Folder:\n{self.mods_target_dir()}",
                     )
-                )
+                ))
             except Exception as e:
                 self.set_status(f"Mod install failed: {e}")
-                self.ui(lambda: messagebox.showerror("Modrinth Install Failed", str(e)))
+                self._installing_mod_ids.discard(project_id)
+                self.ui(lambda: (
+                    self._refresh_mod_cards_state(),
+                    messagebox.showerror("Modrinth Install Failed", str(e)),
+                ))
 
     def _pick_version(self, project_id, game_version, loader):
         param_sets = []
@@ -1618,18 +1698,24 @@ class EclipseClient:
             return
         seen.add(project_id)
 
+        # Skip if already installed (prevents re-downloading already-present dependencies)
+        if project_id in self._mod_map:
+            if depth > 0:
+                return
+            # For the root mod, still allow reinstall (user explicitly clicked Install)
+
         ver = self._pick_version(project_id, game_version, loader)
         if not ver:
             if depth == 0:
                 raise RuntimeError(f"No compatible version for {title_hint or project_id}")
             return
 
-        # Required dependencies first
+        # Required dependencies first — skip if already installed
         for dep in ver.get("dependencies") or []:
             if (dep.get("dependency_type") or "").lower() != "required":
                 continue
             dep_pid = dep.get("project_id")
-            if dep_pid:
+            if dep_pid and dep_pid not in self._mod_map:
                 self.set_status(f"Dependency: {dep_pid}…")
                 self._install_project_recursive(
                     dep_pid, game_version, loader, installed_list, seen, depth=depth + 1
@@ -1639,8 +1725,11 @@ class EclipseClient:
         fname = self._download_primary_file(ver, dest_dir)
         if fname not in installed_list:
             installed_list.append(fname)
+        self._mod_map[project_id] = fname
+        self._save_mod_map()
 
     def refresh_installed_mods(self):
+        self._clean_mod_map()
         mods_dir = self.mods_target_dir()
 
         def apply():
@@ -1672,11 +1761,17 @@ class EclipseClient:
             return
         try:
             path.unlink()
+            # Clean up mod_map
+            stale = [pid for pid, fn in self._mod_map.items() if fn == name]
+            for pid in stale:
+                del self._mod_map[pid]
+            self._save_mod_map()
             pack = self.get_active_modpack()
             if pack and name in pack.get("mods", []):
                 pack["mods"] = [m for m in pack["mods"] if m != name]
                 self._save_config()
             self.refresh_installed_mods()
+            self._refresh_mod_cards_state()
             self.set_status(f"Removed {name}")
         except Exception as e:
             messagebox.showerror("Error", str(e))
