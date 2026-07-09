@@ -12,6 +12,8 @@ import queue
 import webbrowser
 import re
 import io
+import random
+import math
 import requests
 from pathlib import Path
 from PIL import Image, ImageTk
@@ -115,6 +117,7 @@ class EclipseClient:
         self.session = {}
         self.status_queue = queue.Queue()
         self._mod_install_lock = threading.Lock()
+        self.installing_entry_id = None
 
         # Modrinth search state
         self.mod_results = []
@@ -128,6 +131,7 @@ class EclipseClient:
         self._load_config()
         self._make_placeholder_icon()
         self.create_ui()
+        self.root.after(50, self._animate_particles)
         self.root.after(80, self.process_queue)
         self.root.after(200, self.refresh_versions)
         self.root.after(300, self._try_restore_session)
@@ -139,6 +143,10 @@ class EclipseClient:
             icon = self.app_dir / "icon.ico"
             if icon.exists():
                 self.root.iconbitmap(str(icon))
+            png_icon = self.app_dir / "icon.png"
+            if png_icon.exists():
+                ico = ImageTk.PhotoImage(file=str(png_icon))
+                self.root.iconphoto(True, ico)
         except Exception:
             pass
 
@@ -269,6 +277,60 @@ class EclipseClient:
         img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (40, 28, 60, 255))
         self._placeholder_icon = ImageTk.PhotoImage(img)
 
+    # ── Particle background ──────────────────────────────────────────────────
+    def _init_particles(self):
+        self.particles = []
+        palette = ["#2a1a3e", "#1a2a4e", "#3a2a1e", "#1a3a2e", "#4a1a3e", "#2a2a4e"]
+        for _ in range(80):
+            self.particles.append({
+                "x": random.randint(0, 1200),
+                "y": random.randint(0, 900),
+                "dx": random.uniform(-0.5, 0.5),
+                "dy": random.uniform(-0.5, 0.5),
+                "size": random.uniform(1, 3),
+                "color": random.choice(palette),
+            })
+
+    def _animate_particles(self):
+        self.bg_canvas.delete("p")
+        w = max(self.bg_canvas.winfo_width(), 100)
+        h = max(self.bg_canvas.winfo_height(), 100)
+        for p in self.particles:
+            p["x"] += p["dx"]
+            p["y"] += p["dy"]
+            if p["x"] < 0 or p["x"] > w:
+                p["dx"] *= -1
+                p["x"] = max(0, min(w, p["x"]))
+            if p["y"] < 0 or p["y"] > h:
+                p["dy"] *= -1
+                p["y"] = max(0, min(h, p["y"]))
+            x, y, s = p["x"], p["y"], p["size"]
+            self.bg_canvas.create_oval(x - s, y - s, x + s, y + s, fill=p["color"], outline="", tags="p")
+        self.root.after(40, self._animate_particles)
+
+    # ── Install color helpers ────────────────────────────────────────────────
+    def _progress_color(self, p: float) -> str:
+        """Interpolate from blue (0%) through green to yellow (100%)."""
+        p = max(0.0, min(1.0, p))
+        if p < 0.5:
+            t = p * 2
+            r = int(68 + t * (68 - 68))
+            g = int(136 + t * (255 - 136))
+            b = int(255 + t * (136 - 255))
+        else:
+            t = (p - 0.5) * 2
+            r = int(68 + t * (255 - 68))
+            g = int(255 + t * (204 - 255))
+            b = int(136 + t * (0 - 136))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _find_version_index(self, version_id: str) -> int:
+        if hasattr(self, "_version_entries"):
+            for i, e in enumerate(self._version_entries):
+                if e["id"] == version_id:
+                    return i
+        return -1
+
     # ── Config ───────────────────────────────────────────────────────────────
     def _load_config(self):
         self.config = {
@@ -376,6 +438,12 @@ class EclipseClient:
 
     # ── UI shell ─────────────────────────────────────────────────────────────
     def create_ui(self):
+        # Background particle canvas
+        self.bg_canvas = tk.Canvas(self.root, bg=C["bg"], highlightthickness=0, bd=0)
+        self.bg_canvas.pack(fill="both", expand=True)
+        self.bg_canvas.lower()
+        self._init_particles()
+
         header = tk.Frame(self.root, bg=C["bg"])
         header.pack(fill="x", padx=16, pady=(12, 4))
         left_h = tk.Frame(header, bg=C["bg"])
@@ -741,6 +809,10 @@ class EclipseClient:
                     self.percent_var.set(f"{item[1]:.2f}%")
                 elif item[0] == "max":
                     self.progress["maximum"] = max(1, item[1])
+                elif item[0] == "color_update":
+                    idx, pct = item[1], item[2]
+                    if idx < self.vlist.size():
+                        self.vlist.itemconfig(idx, foreground=self._progress_color(pct))
                 elif item[0] == "ui":
                     item[1]()
         except queue.Empty:
@@ -753,6 +825,11 @@ class EclipseClient:
     def update_progress(self, val):
         self.status_queue.put(("progress", val))
         self.status_queue.put(("percent", float(val)))
+        if self.installing_entry_id:
+            pct = max(0.0, min(100.0, float(val)))
+            idx = self._find_version_index(self.installing_entry_id)
+            if idx >= 0:
+                self.status_queue.put(("color_update", idx, pct / 100.0))
 
     def set_max(self, val):
         self.status_queue.put(("max", val))
@@ -868,8 +945,12 @@ class EclipseClient:
             def apply():
                 self.vlist.delete(0, tk.END)
                 self._version_entries = entries
-                for e in entries:
+                for i, e in enumerate(entries):
                     self.vlist.insert(tk.END, e["label"])
+                    if e.get("installed"):
+                        self.vlist.itemconfig(i, foreground=C["success"])
+                    else:
+                        self.vlist.itemconfig(i, foreground=C["moon"])
                 last = self.config.get("last_version") or self.current_version
                 if last:
                     for i, e in enumerate(entries):
@@ -926,6 +1007,11 @@ class EclipseClient:
             messagebox.showwarning("Eclipse Client", "Select a version first.")
             return
         kind = entry.get("kind")
+        self.installing_entry_id = entry.get("id")
+        # Set initial blue color for installing version
+        idx = self._find_version_index(self.installing_entry_id)
+        if idx >= 0:
+            self.vlist.itemconfig(idx, foreground="#4488ff")
         if kind == "modpack":
             threading.Thread(target=self._ensure_modpack_loader, args=(entry["pack_id"],), daemon=True).start()
         elif kind == "loader_offer":
@@ -938,6 +1024,7 @@ class EclipseClient:
             ver = entry["id"]
             if entry.get("installed"):
                 messagebox.showinfo("Already installed", f"{ver} is already on disk.\nSelect it and press Play.")
+                self.installing_entry_id = None
                 return
             self.current_version = ver
             threading.Thread(target=self._install_vanilla, args=(ver,), daemon=True).start()
@@ -948,10 +1035,12 @@ class EclipseClient:
             cb = {"setStatus": self.set_status, "setProgress": self.update_progress, "setMax": self.set_max}
             install_minecraft_version(version, str(self.minecraft_dir), callback=cb)
             self.set_status(f"Installed {version}")
+            self.installing_entry_id = None
             self.ui(lambda: messagebox.showinfo("Eclipse Client", f"{version} is ready."))
             self.refresh_versions()
         except Exception as e:
             self.set_status(f"Install error: {str(e)[:100]}")
+            self.installing_entry_id = None
             self.ui(lambda: messagebox.showerror("Install Failed", str(e)))
 
     def _install_loader(self, loader: str, mc_version: str, quiet: bool = False) -> str | None:
@@ -974,6 +1063,8 @@ class EclipseClient:
                 raise RuntimeError(f"Unsupported loader: {loader}")
 
             gvid = self._find_loader_version_id(loader, mc_version)
+            if gvid:
+                self.installing_entry_id = gvid
             self.set_status(f"{loader.title()} for {mc_version} installed")
             if not quiet:
                 self.ui(
@@ -981,10 +1072,12 @@ class EclipseClient:
                         "Modded install", f"{loader.title()} for Minecraft {mc_version} is ready."
                     )
                 )
+            self.installing_entry_id = None
             self.refresh_versions()
             return gvid
         except Exception as e:
             self.set_status(f"Loader install failed: {e}")
+            self.installing_entry_id = None
             self.ui(lambda: messagebox.showerror("Loader Install Failed", str(e)))
             return None
 
