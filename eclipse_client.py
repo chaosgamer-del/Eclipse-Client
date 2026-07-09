@@ -713,8 +713,12 @@ class EclipseClient:
         tk.Label(inner, textvariable=self.status_var, fg=C["success"], bg=C["panel"], font=("Segoe UI", 9)).pack(
             side="left", padx=18
         )
-        self.progress = ttk.Progressbar(inner, length=220, mode="determinate")
-        self.progress.pack(side="left", padx=8)
+        self.progress = ttk.Progressbar(inner, length=180, mode="determinate")
+        self.progress.pack(side="left", padx=(8, 4))
+        self.percent_var = tk.StringVar(value="0%")
+        tk.Label(inner, textvariable=self.percent_var, fg=C["corona"], bg=C["panel"], font=("Segoe UI", 10, "bold")).pack(
+            side="left", padx=(0, 8)
+        )
 
         self._btn(
             inner, "▶  PLAY", self.launch_game, kind="play", font=("Segoe UI", 12, "bold"), padx=28, pady=8
@@ -733,6 +737,8 @@ class EclipseClient:
                     self.status_var.set(item[1])
                 elif item[0] == "progress":
                     self.progress["value"] = item[1]
+                elif item[0] == "percent":
+                    self.percent_var.set(f"{item[1]:.2f}%")
                 elif item[0] == "max":
                     self.progress["maximum"] = max(1, item[1])
                 elif item[0] == "ui":
@@ -746,6 +752,7 @@ class EclipseClient:
 
     def update_progress(self, val):
         self.status_queue.put(("progress", val))
+        self.status_queue.put(("percent", float(val)))
 
     def set_max(self, val):
         self.status_queue.put(("max", val))
@@ -770,13 +777,13 @@ class EclipseClient:
             want = (self.filter_var.get() or "all").lower()
             entries = []
 
-            # Modpacks always show under modded (and all)
-            if want in ("all", "modded"):
+            # Modpacks only show under the Modded filter to avoid confusion with regular versions
+            if want == "modded":
                 for pack in self.get_modpacks():
                     ready = bool(pack.get("game_version_id")) and (
                         self.minecraft_dir / "versions" / pack["game_version_id"]
                     ).is_dir()
-                    mark = "● " if ready else "○ "
+                    mark = "Installed   " if ready else "Uninstalled  "
                     entries.append(
                         {
                             "kind": "modpack",
@@ -798,7 +805,7 @@ class EclipseClient:
                             {
                                 "kind": "version",
                                 "id": vid,
-                                "label": f"● {vid}  ·  {loader_label_from_id(vid)}",
+                                "label": f"Installed   {vid}  ·  {loader_label_from_id(vid)}",
                                 "installed": True,
                             }
                         )
@@ -813,7 +820,7 @@ class EclipseClient:
                         )
                         # Also skip if a pack uses it
                         synth = f"loader:{loader}:{mc}"
-                        mark = "● " if already else "○ "
+                        mark = "Installed   " if already else "Uninstalled  "
                         entries.append(
                             {
                                 "kind": "loader_offer",
@@ -834,7 +841,7 @@ class EclipseClient:
                     installed_flag = vid in installed_ids or (
                         self.minecraft_dir / "versions" / vid
                     ).is_dir()
-                    mark = "● " if installed_flag else "○ "
+                    mark = "Installed   " if installed_flag else "Uninstalled  "
                     entries.append(
                         {
                             "kind": "version",
@@ -853,7 +860,7 @@ class EclipseClient:
                                 {
                                     "kind": "version",
                                     "id": vid,
-                                    "label": f"● {vid}  ·  installed",
+                                    "label": f"Installed   {vid}  ·  installed",
                                     "installed": True,
                                 }
                             )
@@ -871,7 +878,12 @@ class EclipseClient:
                             self.vlist.see(i)
                             self.current_version = last
                             self.selected_entry = e
-                            self.version_info.config(text=f"Selected: {e['label'].lstrip('●○ ')}")
+                            clean = e['label']
+                            for p in ("Installed   ", "Uninstalled  ", "● ", "○ "):
+                                if clean.startswith(p):
+                                    clean = clean[len(p):]
+                                    break
+                            self.version_info.config(text=f"Selected: {clean}")
                             break
                 self.set_status(f"Loaded {len(entries)} entries")
 
@@ -888,7 +900,12 @@ class EclipseClient:
         self.current_version = entry["id"]
         self.config["last_version"] = entry["id"]
         self._save_config()
-        self.version_info.config(text=f"Selected: {entry['label'].lstrip('●○ ')}")
+        clean = entry['label']
+        for p in ("Installed   ", "Uninstalled  ", "● ", "○ "):
+            if clean.startswith(p):
+                clean = clean[len(p):]
+                break
+        self.version_info.config(text=f"Selected: {clean}")
 
         # If modpack, set active pack for installs
         if entry.get("kind") == "modpack":
@@ -919,6 +936,9 @@ class EclipseClient:
             ).start()
         else:
             ver = entry["id"]
+            if entry.get("installed"):
+                messagebox.showinfo("Already installed", f"{ver} is already on disk.\nSelect it and press Play.")
+                return
             self.current_version = ver
             threading.Thread(target=self._install_vanilla, args=(ver,), daemon=True).start()
 
