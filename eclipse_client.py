@@ -441,8 +441,8 @@ class EclipseClient:
         # Background particle canvas
         self.bg_canvas = tk.Canvas(self.root, bg=C["bg"], highlightthickness=0, bd=0)
         self.bg_canvas.pack(fill="both", expand=True)
-        self.bg_canvas.lower()
         self._init_particles()
+        # Canvas is packed first so it stays behind all other widgets
 
         header = tk.Frame(self.root, bg=C["bg"])
         header.pack(fill="x", padx=16, pady=(12, 4))
