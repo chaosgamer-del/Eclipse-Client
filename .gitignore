@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+build/
+dist/
+eclipse_config.json
+.minecraft/
+*.egg-info/
+.DS_Store
+Thumbs.db
