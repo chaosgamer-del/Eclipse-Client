@@ -118,6 +118,7 @@ class EclipseClient:
         self.status_queue = queue.Queue()
         self._mod_install_lock = threading.Lock()
         self.installing_entry_id = None
+        self._current_max = 100
 
         # Modrinth search state
         self.mod_results = []
@@ -823,14 +824,15 @@ class EclipseClient:
 
     def update_progress(self, val):
         self.status_queue.put(("progress", val))
-        self.status_queue.put(("percent", float(val)))
+        pct = float(val) / self._current_max * 100.0
+        self.status_queue.put(("percent", pct))
         if self.installing_entry_id:
-            pct = max(0.0, min(100.0, float(val)))
             idx = self._find_version_index(self.installing_entry_id)
             if idx >= 0:
-                self.status_queue.put(("color_update", idx, pct / 100.0))
+                self.status_queue.put(("color_update", idx, max(0.0, min(1.0, pct / 100.0))))
 
     def set_max(self, val):
+        self._current_max = max(1, val)
         self.status_queue.put(("max", val))
 
     def ui(self, fn):
